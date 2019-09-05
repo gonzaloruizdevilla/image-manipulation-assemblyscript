@@ -1,0 +1,211 @@
+<html>
+<body>
+<h1>Wasm demo</h1>
+<div id="time">&nbsp;</div>
+<table>
+    <tr>
+        <th><button onclick="js.reset()">Reset</button>
+    <tr>
+        <th>JavaScript
+        <td><button onclick="js.invert()">Invert</button>
+        <td><button onclick="js.grayscale()">Grayscale</button>
+        <td><button onclick="js.sepia()">Sepia</button>
+        <td><button onclick="js.convolve(width, offset.blur, ...matrices.blur )">Blur</button>
+        <td><button onclick="js.convolve(width, offset.edge_detect, ...matrices.edge_detect )">Edge detect</button>
+        <td><button onclick="js.convolve(width, offset.emboss, ...matrices.emboss )">Emboss</button>
+    <tr>
+        <th>AssemblyScript
+        <td><button onclick="as.invert()">Invert</button>
+        <td><button onclick="as.grayscale()">Grayscale</button>
+        <td><button onclick="as.sepia()">Sepia</button>
+        <td><button onclick="as.convolve(width, offset.blur, ...matrices.blur )">Blur</button>
+        <td><button onclick="as.convolve(width, offset.edge_detect, ...matrices.edge_detect )">Edge detect</button>
+        <td><button onclick="as.convolve(width, offset.emboss, ...matrices.emboss )">Emboss</button>
+</table>
+<canvas width="600px" height="600px"></canvas>
+<script>
+    const canvas = document.querySelector("canvas");
+    const width = canvas.width;
+    const height = canvas.height;
+    async function run() {
+        const ctx = await drawCanvas();
+        const imageData = ctx.getImageData(0, 0, width, height);
+        setupJsTransforms(ctx, imageData)
+        await setupAsTransforms(ctx, imageData)
+    }
+    run()
+
+    function setupJsTransforms(ctx, imageData){
+        const backup = imageData.data.slice();
+        Object.assign(js,{
+            reset: js_transform(function reset(data){ data.set(backup)}, imageData, ctx),
+            invert: js_transform(invert, imageData, ctx),
+            grayscale: js_transform(grayscale, imageData, ctx),
+            sepia: js_transform(sepia, imageData, ctx),
+            convolve: js_transform(convolve, imageData, ctx),
+        });
+    }
+
+    async function setupAsTransforms(ctx, imageData){
+        const data = imageData.data;
+        const byteSize = data.length;    
+        const initial = ((byteSize + 0xffff) & ~0xffff) >>> 16 ;
+        const memory = new WebAssembly.Memory({ initial:initial * 2 });
+        const importObject = { env: { memory, abort: () => console.log("Abort!") }};
+        const {instance} = await WebAssembly.instantiateStreaming(
+            fetch("./build/untouched.wasm"),
+            importObject
+        );
+
+        const mem = new Uint8Array(memory.buffer);
+        Object.assign(as,{
+            invert: as_transform("invert", imageData, ctx, mem, instance),
+            grayscale: as_transform("grayscale", imageData, ctx, mem, instance),
+            sepia: as_transform("sepia", imageData, ctx, mem, instance),
+            convolve: as_transform("convolve", imageData, ctx, mem, instance),
+        });
+    }
+
+    async function drawCanvas(){
+        const img = await loadImage();
+        const ctx = canvas.getContext("2d");
+        drawImage(canvas, ctx, img);
+        return ctx;
+    }
+
+    function drawImage(canvas, ctx, img) {
+        var scale = Math.max(width / img.width, height / img.height);
+        var x = (width / 2) - (img.width / 2) * scale;
+        var y = (height / 2) - (img.height / 2) * scale;
+        ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
+    }
+
+    async function loadImage(){
+        return new Promise(resolve => {
+            var img = new Image();
+            img.src = 'photo.jpg';
+            img.onload = function() {
+                resolve(this);
+            };
+        });
+    }
+
+    function js_transform(fn, imageData, ctx) {
+        return (...args) => {
+            let data = imageData.data;
+            let time = new Date()
+            fn(data, ...args);
+            logTime(`JS_${fn.name}`, time)
+            ctx.putImageData(imageData, 0, 0);
+        }
+    };
+
+    function as_transform(fn, imageData, ctx, mem, instance) {
+        return (...args) => {
+            //retrieve image pixels (4 bytes per pixel: RBGA)
+            const data = imageData.data;
+            //copy to bytes to shared memory
+            mem.set(data);
+            
+            //invoque 'fn'  Wasm filter. We need to inform of the image byte size
+            const byteSize = data.length;
+            let time = new Date()
+            instance.exports[fn](byteSize, ...args);
+            logTime(`AS_${fn}`, time);
+
+            //copy the response from the shared memory into the canvas imageData
+            data.set(mem.slice(byteSize, 2*byteSize))
+            ctx.putImageData(imageData, 0, 0);
+        }
+    };
+
+
+    function logTime(name, time){
+        document.getElementById("time").innerText = `${name}: ${new Date() - time} ms `
+    }
+
+    const js = {}
+    const as = {};
+
+    function invert(data) {
+        for (var i = 0; i < data.length; i += 4) {
+            data[i]     = 255 - data[i];     
+            data[i + 1] = 255 - data[i + 1]; 
+            data[i + 2] = 255 - data[i + 2]; 
+        }
+    };
+
+    function grayscale(data){
+        for (var i = 0; i < data.length; i += 4) {
+            const avg = 0.3  * data[i] + 0.59 * data[i + 1] + 0.11 * data[i + 2];
+            data[i]     = avg;  
+            data[i + 1] = avg; 
+            data[i + 2] = avg; 
+        }
+    }
+
+    function sepia(data){
+        for (var i = 0; i < data.length; i += 4) {
+            const avg = 0.3  * data[i] + 0.59 * data[i + 1] + 0.11 * data[i + 2];
+            data[i]     = avg + 100;  
+            data[i + 1] = avg + 50; 
+            data[i + 2] = avg; 
+        }
+    }
+
+    function addConvolveValue(pos, i, data, length){
+        return pos >= 0 && pos < length ? data[pos] : data[i];
+    }
+
+    function convolve(data, w, offset, v00, v01, v02, v10, v11, v12, v20, v21, v22){
+        console.log( w, offset, v00, v01, v02, v10, v11, v12, v20, v21, v22)
+        const divisor = (v00 + v01 + v02 + v10 + v11 + v12 + v20 + v21 + v22) || 1;
+        const length = data.length;
+        let res = 0;
+        let newData = new Uint8Array(length)
+        for(let i = 0; i < length; i++){
+            if ((i + 1) % 4 === 0) {
+                newData[i] = data[i];
+                continue;
+            }
+            let res = v00 * addConvolveValue(i - w * 4 - 4, i, data, length) +
+                      v01 * addConvolveValue(i - w * 4, i, data, length) +
+                      v02 * addConvolveValue(i - w * 4 + 4, i, data, length) +
+                      v10 * addConvolveValue(i - 4, i, data, length) +
+                      v11 * data[i] +
+                      v12 * addConvolveValue(i + 4, i, data, length) +
+                      v20 * addConvolveValue(i + w * 4 - 4, i, data, length) +
+                      v21 * addConvolveValue(i + w * 4 , i, data, length) +
+                      v22 * addConvolveValue(i + w * 4 + 4, i, data, length);
+            res /= divisor;
+            res += offset;
+            newData[i] = res;
+        }
+        data.set(newData)
+    }
+
+    const offset = {
+        'sharpen1':0,
+        'sharpen2':0,
+        'blur':0,
+        'emboss':127,
+        'emboss_subtle':0,
+        'edge_detect':0,
+        'edge_detect_2':0,
+    }
+
+    const matrices = {
+        'sharpen1': [-1, -1, -1, -1,  9, -1, -1, -1, -1],
+        'sharpen2': [ 0, -2,  0, -2, 11, -2,  0, -2,  0],
+        'blur': [ 1,  2,  1, 2,  4,  2, 1,  2,  1],
+        'emboss': [ 2,  0,  0, 0, -1,  0, 0,  0, -1],
+        'emboss_subtle': [ 1,  1, -1, 1,  3, -1, 1, -1, -1], 
+        'edge_detect': [ 1,  1,  1, 1, -7,  1, 1,  1,  1], 
+        'edge_detect_2': [-5,  0,  0, 0,  0,  0,  0,  0,  5],
+    }
+
+
+
+</script>
+</body>
+</html>  
